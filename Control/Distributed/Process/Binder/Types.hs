@@ -10,56 +10,92 @@
 module Control.Distributed.Process.Binder.Types ( 
   ProcessBinder,
   newProcessQueue,
-  runAction
+  runAction,
+  newChan
   )where
 
 import Control.Concurrent.STM
-import Control.Distributed.Process (Process,ProcessId,liftIO)
+import qualified Control.Distributed.Process as P
+import Data.Binary (Binary)
 import Data.Typeable (Typeable,cast)
 import Control.Monad (forever)
 import Control.Distributed.Process.Node (LocalNode,forkProcess)
 
 data Holder = forall a. Typeable a => Holder{internalValue :: a}
 
-data QueuedProcess = QueuedProcess{
-  queuedAction :: Process Holder,
+data ProcessRunOption = RunNonBlocking | RunBlocking
+
+data QueuedProcess = BlockingProcess QueuedProcessBody | NonBlockingProcess QueuedProcessBody
+
+data QueuedProcessBody = QueuedProcessBody{
+  queuedAction :: P.Process Holder,
   resultHolder :: TMVar Holder
   }
   
 
 data ProcessBinder = ProcessBinder{
-  binderProcessId :: ProcessId,
+  binderProcessId :: P.ProcessId,
   processQueue :: TChan QueuedProcess
-  }
+}                     
                      
+
+class ProcessRunner runner where
+  queueProcess :: runner -> a -> IO ()
+  readResult :: runner -> IO a
                      
 castHolder :: Typeable a => Holder -> Maybe a
 castHolder (Holder val) = cast val
     
-processWrapper :: Typeable a => Process a -> Process Holder
+newChan :: (Typeable a, Binary a) => ProcessBinder -> IO (P.SendPort a, P.ReceivePort a)
+newChan binder = newChan' Nothing
+  where
+    newChan' Nothing = runBlockingAction binder P.newChan >>= newChan'
+    newChan' (Just chan) = return chan
+
+processWrapper :: Typeable a => P.Process a -> P.Process Holder
 processWrapper proc = proc >>= return.Holder
-                     
-processRunner :: TChan QueuedProcess -> Process ()
+                           
+processRunner :: TChan QueuedProcess -> P.Process ()
 processRunner chan = forever $ do 
-  qAction <- liftIO $ atomically $ readTChan chan
-  let
-    action = queuedAction qAction
-    resultVar = resultHolder qAction
-  result <- action
-  liftIO $ atomically $ putTMVar resultVar result
+  qAction <- P.liftIO $ atomically $ readTChan chan
+  case qAction of
+    BlockingProcess qAction' -> runBlockingProcess qAction'
+    NonBlockingProcess qAction' -> runNonBlockingProcess qAction'
+    
+  where
+    runNonBlockingProcess qAction = do
+      P.spawnLocal $ runBlockingProcess qAction
+      return ()
+    runBlockingProcess qAction = do      
+      let
+        action = queuedAction qAction
+        resultVar = resultHolder qAction  
+      result <- action
+      P.liftIO $ atomically $ putTMVar resultVar result
   
-runAction :: Typeable a => ProcessBinder -> Process a -> IO (Maybe a)
-runAction binder action = do
+  
+runAction :: Typeable a => ProcessBinder -> P.Process a -> IO (Maybe a)
+runAction = runAction' RunNonBlocking
+
+runBlockingAction :: Typeable a => ProcessBinder -> P.Process a -> IO (Maybe a)
+runBlockingAction = runAction' RunBlocking
+
+runAction' :: Typeable a => ProcessRunOption -> ProcessBinder -> P.Process a -> IO (Maybe a)
+runAction' runOption binder action = do
   resultVar <- newEmptyTMVarIO
   let
-    actionWrapper = QueuedProcess{queuedAction=processWrapper action,
-                                  resultHolder=resultVar}
-  atomically $ writeTChan (processQueue binder) actionWrapper
+    actionWrapper = QueuedProcessBody{queuedAction=processWrapper action,
+                                      resultHolder=resultVar}
+    actionRunner = case runOption of
+      RunNonBlocking -> NonBlockingProcess actionWrapper
+      RunBlocking -> BlockingProcess actionWrapper
+  atomically $ writeTChan (processQueue binder) actionRunner
   result <- atomically $ takeTMVar (resultHolder actionWrapper)
   return $ castHolder result
                      
 newProcessQueue :: LocalNode -> IO ProcessBinder
 newProcessQueue localNode = do
   queue <- newTChanIO
+  blockingChan <- newTChanIO
   pid <- forkProcess localNode $ processRunner queue
   return $ ProcessBinder{binderProcessId=pid,processQueue=queue}
