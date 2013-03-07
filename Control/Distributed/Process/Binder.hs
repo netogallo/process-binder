@@ -7,6 +7,11 @@
 -- easliy abstract away the hassle by handling the communication
 -- with Cloud Haskell inside the IO Monad.
 
-module Control.Distributed.Process.Binder where
+module Control.Distributed.Process.Binder(
+  ProcessBinder,
+  newProcessQueue,
+  runAction,
+  newChan
+  )where
 
 import Control.Distributed.Process.Binder.Types
